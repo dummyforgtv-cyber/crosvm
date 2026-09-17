@@ -1,17 +1,9 @@
-    /// Reproducer for the Firecracker `753888c` partial-overlap check gap.
+    /// Reject accesses that start in-range but extend past the registration.
     ///
-    /// `Bus::get_device` only verifies that the access *start* lies inside a
-    /// registered range (`bus.rs` get_device / contains). `Bus::read` /
-    /// `Bus::write` then forward the entire `data` slice to that device with
-    /// no check that `[addr, addr+data.len())` is contained in the range.
-    /// Firecracker commit 753888c rejects such accesses at the bus layer.
-    ///
-    /// This test documents *current* crosvm behavior: the device whose range
-    /// contains `addr` is still invoked, even when `addr + len` overruns the
-    /// registration, and an adjacent device is *not* dispatched for the
-    /// overrun bytes. That is a bus-API footgun; guest reachability of the
-    /// same shape via KVM_EXIT_MMIO / KVM_EXIT_IO is analyzed separately
-    /// (vcpu → handle_mmio/io → Bus::read/write with kvm-supplied len).
+    /// Matching Firecracker `Bus::with_device`, dispatch requires the whole
+    /// `[addr, addr+len)` to fit so device handlers need not re-check bounds.
+    /// Live copy: `devices/src/bus.rs` test
+    /// `bus_partial_overlap_past_device_range_is_rejected`.
     #[derive(Default)]
     struct RecordingDevice {
         /// (offset, len) of each read/write delivered by the bus.
@@ -55,54 +47,30 @@
     }
 
     #[test]
-    fn bus_partial_overlap_past_device_range_still_dispatches() {
+    fn bus_partial_overlap_past_device_range_is_rejected() {
         let bus = Bus::new(BusType::Mmio);
         let dev_a = Arc::new(Mutex::new(RecordingDevice::default()));
         let dev_b = Arc::new(Mutex::new(RecordingDevice::default()));
 
-        // Device A: [0x1000, 0x1008). Device B immediately adjacent: [0x1008, 0x1010).
+        // Device A: [0x1000, 0x1008). Device B adjacent: [0x1008, 0x1010).
         assert_eq!(bus.insert(dev_a.clone(), 0x1000, 8), Ok(()));
         assert_eq!(bus.insert(dev_b.clone(), 0x1008, 8), Ok(()));
 
-        // 8-byte access starting 4 bytes before the end of A → spans into B's
-        // address range on the bus map. Firecracker would reject this; crosvm
-        // currently hands the full slice to A.
+        // 8-byte access starting 4 bytes before A's end spans into B; reject.
         let mut data = [0u8; 8];
-        assert!(
-            bus.read(0x1004, &mut data),
-            "current tip: start-in-range partial overrun still returns true"
-        );
-        assert_eq!(data, [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7]);
+        assert!(!bus.read(0x1004, &mut data));
+        assert_eq!(data, [0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(dev_a.lock().accesses.is_empty());
+        assert!(dev_b.lock().accesses.is_empty());
 
-        {
-            let a = dev_a.lock();
-            assert_eq!(
-                a.accesses,
-                [(4, 8)],
-                "device A called with offset=4, len=8 (4 bytes past its range)"
-            );
-        }
-        {
-            let b = dev_b.lock();
-            assert!(
-                b.accesses.is_empty(),
-                "adjacent device B must not see the overrun bytes"
-            );
-        }
+        assert!(!bus.write(0x1006, &[1, 2, 3, 4]));
+        assert!(dev_a.lock().accesses.is_empty());
+        assert!(dev_b.lock().accesses.is_empty());
 
-        // Same shape on write.
-        assert!(bus.write(0x1006, &[1, 2, 3, 4]));
-        {
-            let a = dev_a.lock();
-            assert_eq!(a.accesses.last(), Some(&(6, 4)));
-        }
-        {
-            let b = dev_b.lock();
-            assert!(b.accesses.is_empty());
-        }
-
-        // Fully contained access still works (control).
+        // Fully contained access still works.
         let mut in_range = [0u8; 4];
         assert!(bus.read(0x1000, &mut in_range));
+        assert_eq!(in_range, [0xA0, 0xA1, 0xA2, 0xA3]);
         assert_eq!(dev_a.lock().accesses.last(), Some(&(0, 4)));
+        assert!(dev_b.lock().accesses.is_empty());
     }
